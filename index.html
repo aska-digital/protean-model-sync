@@ -78,6 +78,12 @@ footer .wrap{display:flex;flex-wrap:wrap;gap:14px;align-items:center}
 footer a{color:var(--muted);text-decoration:none}
 footer a:hover{color:var(--ink)}
 .spacer{flex:1}
+.aska-return{position:fixed;left:18px;bottom:18px;z-index:2000;display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:999px;background:rgba(11,14,20,.88);border:1px solid rgba(125,211,252,.35);color:var(--accent);font:600 12px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;letter-spacing:.04em;text-decoration:none;backdrop-filter:blur(8px)}
+.aska-return:hover{border-color:var(--accent);color:#fff}
+.aska-made{position:fixed;right:18px;bottom:18px;z-index:2000;margin:0;font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;color:var(--muted)}
+.aska-made a{color:var(--accent);text-decoration:none;border-bottom:1px solid rgba(125,211,252,.45)}
+.aska-made a:hover{color:#fff}
+@media(max-width:560px){.aska-return{left:12px;bottom:12px;padding:10px 14px}.aska-made{right:12px;bottom:12px}}
 </style>
 </head>
 <body>
@@ -270,5 +276,7 @@ document.querySelectorAll('[data-copy]').forEach(function(btn){
   });
 });
 </script>
+<a class="aska-return" href="https://askaconsult.com/">&#8592; Back to ASKA</a>
+<p class="aska-made">Built by <a href="https://askaconsult.com/digital/">Aska Digital</a></p>
 </body>
 </html>
