@@ -108,45 +108,55 @@ const memberProfileName = member => {
   return String(m.name || m.profile || '').trim()
 }
 
-/** Resolve a member's CURRENT live session id for a group at apply time.
+/** Resolve a member's session id for the Groups-tab session.info overlay.
+ * Profile defaults remain the authoritative config read/write target.
  *
- * The persisted Bot Mode room map (`hermes.plugin.hermes-bots.group-chats`,
- * field ``sessions[memberKey]``) can go STALE: when a member's plumbing
- * session is reaped as a ws-orphan (connection dropped, no clean close — which
- * happens on every desktop close), the desktop reconnects and mints a NEW
- * session, but the durable map keeps pointing at the reaped one until the next
- * ``ensureGroupChatSession`` turn. ``config.set`` with that dead sid falls into
- * the gateway's non-live else branch and silently no-ops — pins never change,
- * no tokens ever move to the target model. That is exactly the class of bug
- * this resolver removes.
+ * Current Hermes titles plumbing sessions by immutable roomId (or the legacy
+ * group name) plus a thread: `Group: <room> · <thread>`. The persisted room
+ * map has no selected-thread field, so only a UNIQUE live resolved id is safe
+ * to use. Never pick an arbitrary thread when multiple sessions match.
  *
- * Resolution ladder (mirrors the bundled hermes-bots plugin's own live-session
- * lookup, robust to the reap-on-close behaviour):
- *   1. ``session.list`` (live list, ``include_hidden``) and match the room's
- *      plumbing title ``Group: ${room.roomId || group}``. The live list is
- *      ``ended_at IS NULL``-filtered, so a ws-orphan-reaped session NEVER
- *      matches — only the current live session does. (A raw title-lookup would
- *      not be enough: it returns ``[]`` for an archived row, so after a reap it
- *      would hide the live session and force a stale fallback.)
- *   2. Fall back to the persisted map sid only when the live list contains no
- *      matching title (fresh room, or a backend that predates the title).
- * Returns ``{ sid, live }``.
+ * On a failed/empty live lookup, use a unique persisted thread-scoped pointer
+ * (`thread:<thread>::<memberKey>`), or the bare member pointer for an unmigrated
+ * room. A migrated member's old bare pointer must not be revived.
+ * Returns `{ sid, live }`; ambiguous matches return `{ sid: null, live: false }`.
  */
 async function resolveLiveSessionId(door, member, group, room) {
   const title = `Group: ${room?.roomId || group}`
+  const prefix = `${title} · `
   const key = memberKey(member)
   try {
     const res = await door.request('session.list', { include_hidden: true, limit: 500 })
     const sessions = Array.isArray(res?.sessions) ? res.sessions : []
-    const hit = sessions.find(s => s && (s.title || '') === title && (s.resolved_id || s.id))
-    if (hit) {
-      return { sid: hit.resolved_id || hit.id, live: true }
+    const ids = new Set()
+    for (const session of sessions) {
+      const candidate = session?.title
+      if (typeof candidate !== 'string' ||
+          (candidate !== title && !(candidate.startsWith(prefix) && candidate.slice(prefix.length).trim()))) {
+        continue
+      }
+      const sid = session.resolved_id || session.id
+      if (typeof sid === 'string' && sid) {
+        ids.add(sid)
+      }
+    }
+    if (ids.size) {
+      return { sid: ids.size === 1 ? [...ids][0] : null, live: ids.size === 1 }
     }
   } catch {
-    /* live lookup failed — fall through to the persisted sid below */
+    /* live lookup failed — fall through to the persisted pointers below */
   }
-  const known = room?.sessions?.[key]
-  return { sid: typeof known === 'string' ? known : null, live: false }
+  const sessions = asRecord(room?.sessions)
+  const threadKeys = Object.keys(sessions).filter(candidate => {
+    if (!candidate.startsWith('thread:')) {
+      return false
+    }
+    const boundary = candidate.indexOf('::', 'thread:'.length)
+    return boundary > 'thread:'.length && candidate.slice(boundary + 2) === key
+  })
+  const known = threadKeys.length ? threadKeys.map(candidate => sessions[candidate]) : [sessions[key]]
+  const ids = [...new Set(known.filter(sid => typeof sid === 'string' && sid))]
+  return { sid: ids.length === 1 ? ids[0] : null, live: false }
 }
 
 /** Route descriptor for an agent row; null when the row rides the active

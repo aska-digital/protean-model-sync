@@ -1,25 +1,16 @@
-// Dependency-free logic test for the group-model-sync live-session resolver.
-//
-// Run:  node test/resolver.test.js
-// Exit code 0 = pass, 1 = fail. Uses only Node's assert + fs (no npm deps).
-//
-// Covers the bug this fix removes: the persisted Bot Mode room map
-// (hermes.plugin.hermes-bots.group-chats → sessions[memberKey]) can hold a
-// ws-orphan-reaped sid, so config.set was silently no-op'ing against a dead
-// session. resolveLiveSessionId must prefer the CURRENT live session from the
-// backend and fall back to the persisted map only when no live session exists.
+// Dependency-free test for the Groups-tab session.info overlay resolver.
+// Run: node test/resolver.test.js
+// Uses the production functions, with no Hermes or npm dependencies.
 'use strict'
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 
-const PLUGIN = path.join(__dirname, '..', 'desktop', 'plugin.js')
-const src = fs.readFileSync(PLUGIN, 'utf8')
+const src = fs.readFileSync(path.join(__dirname, '..', 'desktop', 'plugin.js'), 'utf8')
 
-// Extract a top-level function/const by its opening line, balanced-brace aware.
 function extract(opening) {
   const i = src.indexOf(opening)
-  assert.notStrictEqual(i, -1, `extract(): opening not found: ${opening}`)
+  assert.notStrictEqual(i, -1, 'opening not found: ' + opening)
   let depth = 0
   for (let j = i; j < src.length; j++) {
     if (src[j] === '{') depth++
@@ -28,71 +19,120 @@ function extract(opening) {
       if (depth === 0) return src.slice(i, j + 1)
     }
   }
-  throw new Error(`extract(): unbalanced: ${opening}`)
+  throw new Error('unbalanced function: ' + opening)
 }
 
-// Evaluate memberKey + resolveLiveSessionId in one shared scope. Function
-// declarations hoist; `const memberKey` is block-scoped and won't attach to a
-// plain eval context, so we explicitly publish both to globalThis after eval.
-const asRecord = o => (o && typeof o === 'object' && !Array.isArray(o) ? o : {})
-const probeCode = extract('const memberKey = member => {') + '\n' + extract('async function resolveLiveSessionId') + '\n'
-// eslint-disable-next-line no-eval
-eval(probeCode)
-if (typeof resolveLiveSessionId !== 'function') {
-  // strict-mode eval keeps declarations local — fall back to an indirect eval
-  // into global scope so the test can reach them.
-  const { runInThisContext } = require('vm')
-  runInThisContext(probeCode)
-}
-globalThis.asRecord = asRecord
-globalThis.memberKey = memberKey
-globalThis.resolveLiveSessionId = resolveLiveSessionId
+// A private scope avoids leaking declarations into the test process.
+const resolveLiveSessionId = new Function(
+  src.match(/^const asRecord = value =>.*$/m)[0] + '\n' +
+  extract('const memberKey = member => {') + '\n' +
+  extract('async function resolveLiveSessionId') + '\nreturn resolveLiveSessionId'
+)()
 
-const STALE_SID = '20260819_023417_a5fbb0' // persisted map → reaped Aug-29
-const LIVE_SID = '20260818_195823_d9de95' // current live Group: Nani session
-const room = { roomId: null, sessions: { azaraki: STALE_SID } }
+const STALE = 'stale'
+const LIVE = 'live'
 const member = { name: 'azaraki' }
+const legacyRoom = { sessions: { azaraki: STALE } }
+const room = { roomId: 'room-id', sessions: { azaraki: STALE } }
+const empty = { request: async () => ({ sessions: [] }) }
+const failed = { request: async () => { throw new Error('offline') } }
+const live = { sid: LIVE, live: true }
+const stale = { sid: STALE, live: false }
+const absent = { sid: null, live: false }
+let checks = 0
 
-// 1. Live session list contains the real Group: Nani session → must win over
-//    the stale persisted sid (this is the exact bug).
-const liveDoor = {
-  request: async () => ({
-    sessions: [
-      { id: LIVE_SID, title: 'Group: Nani', resolved_id: LIVE_SID },
-      { id: 'other', title: 'Group: Tafsir', resolved_id: 'other' },
-    ],
-  }),
+function door(sessions) {
+  return {
+    request: async (method, params) => {
+      assert.strictEqual(method, 'session.list')
+      assert.deepStrictEqual(params, { include_hidden: true, limit: 500 })
+      return { sessions }
+    }
+  }
 }
 
-// 2. Desktop closed / all reaped → live list empty → graceful persisted fallback.
-const deadDoor = { request: async () => ({ sessions: [] }) }
-
-// 3. Compression tip: resolved_id differs from id → the tip is the live target.
-const tipDoor = {
-  request: async () => ({
-    sessions: [{ id: 'old-root', title: 'Group: Nani', resolved_id: LIVE_SID }],
-  }),
+async function check(label, rpc, targetRoom, expected, group = 'Nani', targetMember = member) {
+  assert.deepStrictEqual(await resolveLiveSessionId(rpc, targetMember, group, targetRoom), expected, label)
+  checks++
 }
-
-// 4. Backend error → must not throw; falls back to persisted map.
-const errDoor = { request: async () => { throw new Error('boom') } }
 
 async function main() {
-  const t1 = await resolveLiveSessionId(liveDoor, member, 'Nani', room)
-  assert.deepStrictEqual(t1, { sid: LIVE_SID, live: true },
-    'live match must beat stale persisted sid')
+  await check('legacy exact title beats stale pointer',
+    door([{ id: LIVE, title: 'Group: Nani' }]), legacyRoom, live)
+  await check('empty live list keeps unmigrated persisted pointer', empty, legacyRoom, stale)
+  await check('compressed root resolves to its live tip',
+    door([{ id: 'root', resolved_id: LIVE, title: 'Group: Nani' }]), legacyRoom, live)
+  await check('RPC failure keeps unmigrated persisted pointer', failed, legacyRoom, stale)
 
-  const t2 = await resolveLiveSessionId(deadDoor, member, 'Nani', room)
-  assert.deepStrictEqual(t2, { sid: STALE_SID, live: false },
-    'no live session → graceful persisted fallback')
+  // Current Hermes titles use the immutable room id plus a delimited thread.
+  await check('current room and thread title beats stale pointer',
+    door([{ id: LIVE, title: 'Group: room-id · topic-1' }]), room, live)
+  await check('display rename retains durable room identity',
+    door([{ id: LIVE, title: 'Group: room-id · topic-1' }]), room, live, 'Renamed')
+  await check('legacy room can also use a current thread title',
+    door([{ id: LIVE, title: 'Group: Nani · topic-1' }]), legacyRoom, live)
+  await check('legacy exact durable-id title is still supported',
+    door([{ id: LIVE, title: 'Group: room-id' }]), room, live)
+  await check('same display name with a new room id must not match the old room',
+    door([{ id: 'old', title: 'Group: old-room-id · topic-1' }]), room, stale)
+  await check('room prefix collision does not match',
+    door([{ id: 'other', title: 'Group: room-id-2 · topic-1' }]), room, stale)
+  await check('empty suffix, wrong delimiter and malformed titles do not match',
+    door([
+      null,
+      { id: 'bad', title: 42 },
+      { id: 'bad', title: 'Group: room-id · ' },
+      { id: 'bad', title: 'Group: room-id ·    ' },
+      { id: 'bad', title: 'Group: room-id ·topic-1' },
+      { id: 'bad', title: 'Group: room-id extra' },
+      { title: 'Group: room-id · topic-1' }
+    ]), room, stale)
 
-  const t3 = await resolveLiveSessionId(tipDoor, member, 'Nani', room)
-  assert.strictEqual(t3.sid, LIVE_SID, 'resolved_id (compression tip) must be used')
+  // Room storage has no selected-thread field: never choose the first thread.
+  await check('multiple live threads suppress the overlay, not revive a stale pointer',
+    door([
+      { id: 'thread-a', title: 'Group: room-id · topic-a' },
+      { id: 'thread-b', title: 'Group: room-id · topic-b' }
+    ]), room, absent)
+  await check('legacy and current live sessions are also ambiguous',
+    door([
+      { id: 'legacy', title: 'Group: room-id' },
+      { id: LIVE, title: 'Group: room-id · topic-1' }
+    ]), room, absent)
+  await check('multiple compressed roots with the same resolved tip are unambiguous',
+    door([
+      { id: 'root-a', resolved_id: LIVE, title: 'Group: room-id · topic-1' },
+      { id: 'root-b', resolved_id: LIVE, title: 'Group: room-id · topic-1' }
+    ]), room, live)
 
-  const t4 = await resolveLiveSessionId(errDoor, member, 'Nani', room)
-  assert.strictEqual(t4.live, false, 'backend error → non-live fallback, no throw')
+  const migrated = { roomId: 'room-id', sessions: {
+    azaraki: STALE, 'thread:topic-1::azaraki': 'stored-thread',
+    'thread:topic-1::someone-else': 'other-member'
+  } }
+  await check('unique persisted thread pointer replaces the migrated bare pointer', empty,
+    migrated, { sid: 'stored-thread', live: false })
+  await check('RPC failure uses the unique persisted thread pointer', failed,
+    migrated, { sid: 'stored-thread', live: false })
+  await check('multiple persisted threads suppress the overlay', empty,
+    { sessions: { azaraki: STALE, 'thread:a::azaraki': 'a', 'thread:b::azaraki': 'b' } }, absent)
+  await check('same persisted id under multiple thread keys is unambiguous', empty,
+    { sessions: { 'thread:a::azaraki': LIVE, 'thread:b::azaraki': LIVE } }, { sid: LIVE, live: false })
+  await check('another member migrating does not invalidate the bare pointer', empty,
+    { sessions: { azaraki: STALE, 'thread:a::someone-else': 'other' } }, stale)
+  await check('legacy true sentinel never becomes a session id', empty,
+    { sessions: { azaraki: true } }, absent)
+  await check('migrated sentinel does not revive the old bare pointer', empty,
+    { sessions: { azaraki: STALE, 'thread:a::azaraki': true } }, absent)
+  await check('source-qualified thread member keys keep their full identity', empty,
+    { sessions: { 'thread:a::remote::azaraki': LIVE, 'thread:a::azaraki': 'other' } },
+    { sid: LIVE, live: false }, 'Nani',
+    { name: 'azaraki', connectionId: 'remote', sourceScoped: true })
+  await check('malformed thread key and member suffix collision do not match', empty,
+    { sessions: { 'thread:::azaraki': 'bad', 'thread:a::prefix::azaraki': 'other' } }, absent)
+  await check('missing room and malformed live response degrade gracefully',
+    { request: async () => ({ sessions: {} }) }, undefined, absent)
 
-  console.log('resolver.test.js: 4/4 passed')
+  console.log('resolver.test.js: ' + checks + '/' + checks + ' passed')
 }
 
 main().catch(err => {
